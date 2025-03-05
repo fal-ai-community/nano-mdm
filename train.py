@@ -538,14 +538,23 @@ def train(
         if it > num_iterations - warmdown_iters:
             return (num_iterations - it) / warmdown_iters
         return 1.0
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=learning_rate * 256 / n_embed,
-        betas=(0.9, 0.95),
-        weight_decay=weight_decay,
-        fused=True,
-    )
+    
+    parameters = []
+    parameter_configs = []
+    for name, param in model.named_parameters():
+        
+        if any(x in name for x in ['wte', 'bias']):
+            parameters.append({"params": param, "lr" : learning_rate * 0.1, 'weight_decay' : 0.01})
+            parameter_configs.append({"name": name, "lr" : learning_rate * 0.1, 'weight_decay' : 0.01})
+        else:
+            
+            assert param.ndim == 2
+            fan_in = param.shape[1]
+            
+            parameters.append({"params": param, "lr" : learning_rate * 32 / fan_in, 'weight_decay' : 0.1 * fan_in / 4096})
+            parameter_configs.append({"name": name, "lr" : learning_rate * 32 / fan_in, 'weight_decay' : 0.1 * fan_in / 4096})
+            
+    optimizer = torch.optim.AdamW(parameters, lr=learning_rate, betas=(0.9, 0.95), fused=True)
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
