@@ -30,7 +30,9 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 
-MASK_TOKEN = 50304 + 1
+VOCAB_SIZE = 101000
+MASK_TOKEN = VOCAB_SIZE - 1
+EOS_TOKEN = 100257
 
 
 def _peek_data_shard(filename):
@@ -60,8 +62,7 @@ def _load_data_shard(filename):
         assert header[0] == 20240520, "magic number mismatch in the data .bin file"
         assert header[1] == 1, "unsupported version"
         ntok = header[2]  # number of tokens (claimed)
-        # the rest of it are tokens, stored as uint16
-        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+        tokens = np.frombuffer(f.read(), dtype=np.uint32)
     assert len(tokens) == ntok, "number of tokens read does not match header?"
     return tokens
 
@@ -100,19 +101,6 @@ class DistributedDataLoader:
         self.current_position = self.process_rank * self.B * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
 
-    # def next_batch(self):
-    #     B = self.B
-    #     T = self.T
-    #     buf = self.tokens[self.current_position : self.current_position + B * T + 1]
-    #     buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-    #     x = (buf[:-1]).view(B, T)  # inputs
-    #     y = (buf[1:]).view(B, T)  # targets
-    #     # advance current position and load next shard if necessary
-    #     self.current_position += B * T * self.num_processes
-    #     if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-    #         self.advance()
-    #     return x.cuda(), y.cuda()
-
     def next_batch(self):
         generator = torch.Generator(device="cpu")
         generator.manual_seed(
@@ -127,9 +115,13 @@ class DistributedDataLoader:
         x_noisy = x.clone()
 
         rand_per_index = torch.rand((B, T), generator=generator)
+        rand_per_index[x == EOS_TOKEN] = 10.0
+
         timestep_per_batch = torch.rand((B, 1), generator=generator)
         for b in range(B):  # on batch axis
+            prefix_len = torch.randint(32, 256, (1,), generator=generator)
             x_noisy[b, rand_per_index[b] < timestep_per_batch[b]] = MASK_TOKEN
+            x_noisy[b, :prefix_len] = x[b, :prefix_len]  # prefix is not masked
 
         self.current_position += B * T * self.num_processes
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
@@ -159,7 +151,7 @@ def log_gpu_memory():
 
 @dataclass
 class MDMConfig:
-    vocab_size: int = 50304 + 1  # NanoMDM's vocab size + 1 for mask token
+    vocab_size: int = VOCAB_SIZE
     block_size: int = 1024  # Maximum sequence length
     n_layer: int = 12
     n_head: int = 6
@@ -221,7 +213,6 @@ class SelfAttention(nn.Module):
             self.lamb1 = 1.0
             self.lamb2 = 0.0
 
-    @torch.compile()
     def forward(self, x, kv_cache=None, freq=None, v1=None):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality
 
@@ -235,35 +226,12 @@ class SelfAttention(nn.Module):
 
         v = self.lamb1 * v + self.lamb2 * v1.view_as(v)
 
-        if kv_cache is not None:
-            raise NotImplementedError("kv_cache is not implemented")
-            k_cache, v_cache = kv_cache
-
-            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-            q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
-
-            if k_cache is not None:
-                if isinstance(k_cache, int):
-                    k_cache = k
-                    v_cache = v
-                else:
-                    k = torch.cat([k_cache, k], dim=1)
-                    v = torch.cat([v_cache, v], dim=1)  # it cats in T dim.
-
-                new_kv_cache = (k, v)
-
-            # do classic attention.
-            y = F.scaled_dot_product_attention(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=False
-            )
-
-        else:
-            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-            q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
-            new_kv_cache = None
-            y = F.scaled_dot_product_attention(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=False
-            )
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
+        new_kv_cache = None
+        y = F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=False
+        )
 
         y = y.transpose(1, 2).contiguous().view_as(x)
         y = self.c_proj(y)
@@ -363,49 +331,18 @@ class MDM(nn.Module):
 
         return logits, loss
 
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = (
-                idx
-                if idx.size(1) <= self.config.block_size
-                else idx[:, -self.config.block_size :]
-            )
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float("Inf")
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
-        return idx
-
 
 @click.command()
 @click.option("--run_name", default="test", help="Name of the run")
 @click.option("--project_name", default="nanoMDM", help="Name of the project")
 @click.option(
     "--train_data",
-    default="data/fineweb10B/fineweb_train_*.bin",
+    default="/home/ubuntu/simo/0306/nano-llada/process_fineweb/fineweb_edu_shards/shard_*.bin",
     help="Path to training data",
 )
 @click.option(
     "--val_data",
-    default="data/fineweb10B/fineweb_val_*.bin",
+    default="/home/ubuntu/simo/0306/nano-llada/process_fineweb/fineweb_edu_shards/val_shard_*.bin",
     help="Path to validation data",
 )
 @click.option(
@@ -415,16 +352,16 @@ class MDM(nn.Module):
 @click.option("--num_iterations", default=5100, help="Number of training iterations")
 @click.option("--learning_rate", default=3.6e-3, help="Learning rate")
 @click.option("--weight_decay", default=0.1, help="Weight decay")
-@click.option("--warmup_iters", default=0, help="Warmup iterations")
-@click.option("--warmdown_iters", default=1450, help="Warmdown iterations")
-@click.option("--val_every", default=125, help="Validation frequency")
-@click.option("--save_every", default=1000, help="Checkpoint save frequency")
+@click.option("--warmup_iters", default=100, help="Warmup iterations")
+@click.option("--warmdown_iters", default="10%", help="Warmdown iterations")
+@click.option("--val_every", default=100, help="Validation frequency")
+@click.option("--save_every", default=4000, help="Checkpoint save frequency")
 @click.option("--n_embed", default=768, help="Embedding dimension")
 @click.option("--init_ckpt", default=None, help="Path to initial checkpoint")
 @click.option("--vres", default=False, help="Use vres")
 @click.option("--n_layer", default=12, help="Number of layers")
 @click.option("--n_head", default=6, help="Number of heads")
-@click.option("--ff_expand", default=2, help="FF expand")
+@click.option("--ff_expand", default=4, help="FF expand")
 @click.option("--sequence_length", default=1024, help="Sequence length")
 @click.option("--tags", default="", help="Tags for the run")
 def train(
@@ -517,8 +454,9 @@ def train(
     # broadcast all parameters to ensure they start in sync across GPUs
     for param in model.parameters():
         dist.broadcast(param.data, src=0)
-    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
+    model = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module
+    model = torch.compile(model)
 
     # Create datasets
     if master_process:
@@ -532,29 +470,52 @@ def train(
         val_data, per_gpu_batch_size, sequence_length, ddp_rank, ddp_world_size
     )
 
+    if isinstance(warmdown_iters, str):
+        # make "10%" -> 0.1
+        warmdown_iters = float(warmdown_iters.strip("%")) / 100
+        warmdown_iters = int(num_iterations * float(warmdown_iters))
+
     def get_lr(it):
         if it < warmup_iters:
             return it / warmup_iters
         if it > num_iterations - warmdown_iters:
             return (num_iterations - it) / warmdown_iters
         return 1.0
-    
+
     parameters = []
     parameter_configs = []
     for name, param in model.named_parameters():
-        
-        if any(x in name for x in ['wte', 'bias']):
-            parameters.append({"params": param, "lr" : learning_rate * 0.1, 'weight_decay' : 0.01})
-            parameter_configs.append({"name": name, "lr" : learning_rate * 0.1, 'weight_decay' : 0.01})
+
+        if any(x in name for x in ["wte", "bias", "lam"]):
+            parameters.append(
+                {"params": param, "lr": learning_rate * 0.1, "weight_decay": 0.01}
+            )
+            parameter_configs.append(
+                {"name": name, "lr": learning_rate * 0.1, "weight_decay": 0.01}
+            )
         else:
-            
+
             assert param.ndim == 2
             fan_in = param.shape[1]
-            
-            parameters.append({"params": param, "lr" : learning_rate * 32 / fan_in, 'weight_decay' : 0.1 * fan_in / 4096})
-            parameter_configs.append({"name": name, "lr" : learning_rate * 32 / fan_in, 'weight_decay' : 0.1 * fan_in / 4096})
-            
-    optimizer = torch.optim.AdamW(parameters, lr=learning_rate, betas=(0.9, 0.95), fused=True)
+
+            parameters.append(
+                {
+                    "params": param,
+                    "lr": learning_rate * 32 / fan_in,
+                    "weight_decay": 0.1 * fan_in / 4096,
+                }
+            )
+            parameter_configs.append(
+                {
+                    "name": name,
+                    "lr": learning_rate * 32 / fan_in,
+                    "weight_decay": 0.1 * fan_in / 4096,
+                }
+            )
+
+    optimizer = torch.optim.AdamW(
+        parameters, lr=learning_rate, betas=(0.9, 0.95), fused=True
+    )
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
@@ -597,10 +558,9 @@ def train(
     for step in range(num_iterations):
         for micro_step in range(grad_accum_steps):
             with ctx:
-                # print(f"Rank {ddp_rank}, batch: {x}")
-                logits, loss = model(x.to(device), y.to(device))
+
+                _, loss = model(x.to(device), y.to(device))
                 loss = loss / grad_accum_steps
-                # print(f"Rank {ddp_rank}, loss: {loss.item()}")
                 loss.backward()
 
             if master_process:
