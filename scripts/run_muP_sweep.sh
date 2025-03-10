@@ -27,6 +27,6 @@ for n_embed in ${n_embeds[@]}; do
             --project_name "muP_sweep_nanomdm_exp" \
             --tags "n_embed=$n_embed,lr=$lr" \
             --vres=True \
-            --warmdown_iters="0%"
+            --warmdown_iters="10%"
     done
 done

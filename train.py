@@ -156,7 +156,6 @@ class MDMConfig:
     n_layer: int = 12
     n_head: int = 6
     n_embed: int = 768
-    wte_init_std: float = 0.02
     v_residual: bool = False
     ff_expand: float = 1.0
 
@@ -230,7 +229,11 @@ class SelfAttention(nn.Module):
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
         new_kv_cache = None
         y = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=False
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            is_causal=False,
+            scale=2.0 / math.sqrt(self.head_dim),
         )
 
         y = y.transpose(1, 2).contiguous().view_as(x)
@@ -288,10 +291,11 @@ class MDM(nn.Module):
                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             )
         )
-        self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(
+            config.n_embed, nearest_mult_of(config.vocab_size, 256), bias=False
+        )
         self.lm_head.weight.data.zero_()
         self.rotary = Rotary(config.n_embed // (config.n_head))
-        self.transformer.wte.weight.data.normal_(mean=0.0, std=config.wte_init_std)
 
     def forward(self, idx, targets=None):
         # forward the MDM model itself
@@ -304,7 +308,7 @@ class MDM(nn.Module):
 
         x = F.rms_norm(x, (x.size(-1),))
         logits = self.lm_head(x)
-        logits = logits.float()
+        logits = 30 * torch.sigmoid(logits.float() / 7.5)
 
         # if we are given some desired targets also calculate the loss
         loss = None
@@ -358,12 +362,33 @@ class MDM(nn.Module):
 @click.option("--save_every", default=4000, help="Checkpoint save frequency")
 @click.option("--n_embed", default=768, help="Embedding dimension")
 @click.option("--init_ckpt", default=None, help="Path to initial checkpoint")
-@click.option("--vres", default=False, help="Use vres")
+@click.option("--vres", default=True, help="Use vres")
 @click.option("--n_layer", default=12, help="Number of layers")
 @click.option("--n_head", default=6, help="Number of heads")
 @click.option("--ff_expand", default=4, help="FF expand")
 @click.option("--sequence_length", default=1024, help="Sequence length")
 @click.option("--tags", default="", help="Tags for the run")
+@click.option("--lr_wtexweight", default=1.0, type=float)
+@click.option("--lr_attnxc_qxweight", default=1.0, type=float)
+@click.option("--lr_attnxc_kxweight", default=1.0, type=float)
+@click.option("--lr_attnxc_vxweight", default=1.0, type=float)
+@click.option("--lr_attnxc_projxweight", default=1.0, type=float)
+@click.option("--lr_mlpxc_fcxweight", default=1.0, type=float)
+@click.option("--lr_mlpxc_projxweight", default=1.0, type=float)
+@click.option("--lr_lm_headxweight", default=1.0, type=float)
+@click.option("--lr_lamb1", default=1.0, type=float)
+@click.option("--lr_lamb2", default=1.0, type=float)
+@click.option("--initstd_wtexweight", default=1.0, type=float)
+@click.option("--initstd_attnxc_qxweight", default=1.0, type=float)
+@click.option("--initstd_attnxc_kxweight", default=1.0, type=float)
+@click.option("--initstd_attnxc_vxweight", default=1.0, type=float)
+@click.option("--initstd_attnxc_projxweight", default=1.0, type=float)
+@click.option("--initstd_mlpxc_fcxweight", default=1.0, type=float)
+@click.option("--initstd_mlpxc_projxweight", default=1.0, type=float)
+@click.option("--initstd_lm_headxweight", default=1.0, type=float)
+@click.option("--initstd_lamb1", default=0.5, type=float)
+@click.option("--initstd_lamb2", default=0.5, type=float)
+@click.option("--do_compile", default=False, type=bool)
 def train(
     run_name,
     project_name,
@@ -386,6 +411,27 @@ def train(
     ff_expand,
     sequence_length,
     tags,
+    lr_wtexweight: float,
+    lr_attnxc_qxweight: float,
+    lr_attnxc_kxweight: float,
+    lr_attnxc_vxweight: float,
+    lr_attnxc_projxweight: float,
+    lr_mlpxc_fcxweight: float,
+    lr_mlpxc_projxweight: float,
+    lr_lm_headxweight: float,
+    lr_lamb1: float,
+    lr_lamb2: float,
+    initstd_wtexweight: float,
+    initstd_attnxc_qxweight: float,
+    initstd_attnxc_kxweight: float,
+    initstd_attnxc_vxweight: float,
+    initstd_attnxc_projxweight: float,
+    initstd_mlpxc_fcxweight: float,
+    initstd_mlpxc_projxweight: float,
+    initstd_lm_headxweight: float,
+    initstd_lamb1: float,
+    initstd_lamb2: float,
+    do_compile: bool,
 ):
     dist.init_process_group(backend="nccl")
     ddp_rank = int(os.environ["RANK"])
@@ -444,6 +490,45 @@ def train(
     print(f"Total number of parameters: {total_params}")
     # count total activated parameters.
     total_activated_params = 0
+
+    # first setup the initstd parameters
+    # args that start with initstd_
+    # Extract all initstd parameters from command line arguments
+    initstd_params = {}
+    for key, value in locals().items():
+        if key.startswith("initstd_"):
+            param_name = key[len("initstd_") :]  # Remove 'initstd_' prefix
+            param_name = param_name.replace("x", ".")
+            initstd_params[param_name] = value
+
+    print(initstd_params)
+
+    def get_std_value(param_name):
+        for key, value in initstd_params.items():
+            if param_name.endswith(key):
+                return value
+        raise ValueError(f"Unknown parameter during initstd setup: {param_name}")
+
+    if master_process:
+        logging.info(f"Initialization standard deviation parameters: {initstd_params}")
+
+    # Apply initialization standard deviations to model parameters
+
+    def get_fan_in(param_name, param_shape):
+        if "wte" in param_name:
+            return 1
+        elif "weight" in param_name and len(param_shape) == 2:
+            return param_shape[1]
+        else:
+            return 1
+
+    for name, param in model.named_parameters():
+        std_multiplier = get_std_value(name)
+        fan_in = get_fan_in(name, param.shape)
+        param.data.normal_(mean=0.0, std=std_multiplier / math.sqrt(fan_in))
+        if master_process:
+            logging.info(f"Initialized {name} with std={std_multiplier}")
+
     for name, param in model.named_parameters():
         if any(name.startswith(x) for x in ["lm_head", "rotary", "wte"]):
             continue
@@ -454,9 +539,11 @@ def train(
     # broadcast all parameters to ensure they start in sync across GPUs
     for param in model.parameters():
         dist.broadcast(param.data, src=0)
+
     model = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module
-    model = torch.compile(model)
+    if do_compile:
+        model = torch.compile(model)
 
     # Create datasets
     if master_process:
@@ -484,34 +571,50 @@ def train(
 
     parameters = []
     parameter_configs = []
+
+    # first setup the lr parameters
+    # args that start with lr_
+    # Extract all lr parameters from command line arguments
+    lr_params = {}
+    for key, value in locals().items():
+        if key.startswith("lr_"):
+            param_name = key[len("lr_") :]  # Remove 'lr_' prefix
+            param_name = param_name.replace("x", ".")
+            lr_params[param_name] = value
+
+    def get_lr_value(param_name):
+        for key, value in lr_params.items():
+            if param_name.endswith(key):
+                return value
+        raise ValueError(f"Unknown parameter during lr setup: {param_name}")
+
+    if master_process:
+        logging.info(f"Learning rate parameters: {lr_params}")
+
     for name, param in model.named_parameters():
-
-        if any(x in name for x in ["wte", "bias", "lam"]):
-            parameters.append(
-                {"params": param, "lr": learning_rate * 0.1, "weight_decay": 0.01}
-            )
-            parameter_configs.append(
-                {"name": name, "lr": learning_rate * 0.1, "weight_decay": 0.01}
-            )
-        else:
-
-            assert param.ndim == 2
-            fan_in = param.shape[1]
-
-            parameters.append(
-                {
-                    "params": param,
-                    "lr": learning_rate * 32 / fan_in,
-                    "weight_decay": 0.1 * fan_in / 4096,
-                }
-            )
+        lr_multiplier_value = get_lr_value(name)
+        fan_in = get_fan_in(name, param.shape)
+        parameters.append(
+            {
+                "params": param,
+                "lr": learning_rate * lr_multiplier_value / fan_in,
+                "weight_decay": weight_decay * fan_in / 4096,
+            }
+        )
+        with torch.no_grad():
             parameter_configs.append(
                 {
                     "name": name,
-                    "lr": learning_rate * 32 / fan_in,
-                    "weight_decay": 0.1 * fan_in / 4096,
+                    "lr": learning_rate * lr_multiplier_value / fan_in,
+                    "weight_decay": weight_decay * fan_in / 4096,
+                    "fan_in": fan_in,
+                    "std": param.data.std(unbiased=False).item(),
                 }
             )
+
+    # save as json
+    with open(f"logs/parameter_configs_{run_id}.json", "w") as f:
+        json.dump(parameter_configs, f)
 
     optimizer = torch.optim.AdamW(
         parameters, lr=learning_rate, betas=(0.9, 0.95), fused=True
@@ -630,11 +733,25 @@ def train(
                 "scheduler": scheduler.state_dict(),
                 "step": step,
                 "config": raw_model.config,
+                "std_init_params": initstd_params,
+                "lr_params": lr_params,
+                "parameter_configs": parameter_configs,
             }
             os.makedirs(f"logs/ckpts_{run_id}", exist_ok=True)
             ckpt_path = f"logs/ckpts_{run_id}/step_{step}.pt"
             torch.save(checkpoint, ckpt_path)
             logging.info(f"Checkpoint saved to {ckpt_path}")
+
+            with open("temp_output.json", "w") as f:
+                json.dump(
+                    {
+                        "step": step,
+                        "loss": loss.item(),
+                        "val_loss": val_loss.item(),
+                        "run_name": run_name,
+                    },
+                    f,
+                )
 
     if master_process:
         total_time = time.time() - t_start
